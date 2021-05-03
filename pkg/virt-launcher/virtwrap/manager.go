@@ -100,8 +100,6 @@ type DomainManager interface {
 	GetUsers() ([]v1.VirtualMachineInstanceGuestOSUser, error)
 	GetFilesystems() ([]v1.VirtualMachineInstanceFileSystem, error)
 	FinalizeVirtualMachineMigration(*v1.VirtualMachineInstance) error
-	InterfacesStatus(domainInterfaces []api.Interface) []api.InterfaceStatus
-	GetGuestOSInfo() api.GuestOSInfo
 }
 
 type LibvirtDomainManager struct {
@@ -449,7 +447,7 @@ func (l *LibvirtDomainManager) preStartHook(vmi *v1.VirtualMachineInstance, doma
 		}
 	}
 
-	err = network.SetupPodNetworkPhase2(vmi, domain, l.networkCacheStoreFactory)
+	err = network.NewVMNetworkConfigurator(vmi, l.networkCacheStoreFactory).SetupPodNetworkPhase2(domain)
 	if err != nil {
 		return domain, fmt.Errorf("preparing the pod network failed: %v", err)
 	}
@@ -702,6 +700,8 @@ func (l *LibvirtDomainManager) generateConverterContext(vmi *v1.VirtualMachineIn
 		c.MemBalloonStatsPeriod = uint(options.MemBalloonStatsPeriod)
 		// Add preallocated and thick-provisioned volumes for which we need to avoid the discard=unmap option
 		c.VolumesDiscardIgnore = options.PreallocatedVolumes
+		// Disk iotune configuration
+		c.DiskIoTune = options.DiskIoTune
 	}
 
 	if !isMigrationTarget {
@@ -781,12 +781,17 @@ func (l *LibvirtDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, useEmulat
 		if err != nil {
 			return nil, err
 		}
-		err = dom.Create()
+		createFlags := getDomainCreateFlags(vmi)
+		err = dom.CreateWithFlags(createFlags)
 		if err != nil {
-			logger.Reason(err).Error("Starting the VirtualMachineInstance failed.")
+			logger.Reason(err).
+				Errorf("Failed to start VirtualMachineInstance with flags %v.", createFlags)
 			return nil, err
 		}
 		logger.Info("Domain started.")
+		if vmi.ShouldStartPaused() {
+			l.paused.add(vmi.UID)
+		}
 	} else if cli.IsPaused(domState) && !l.paused.contains(vmi.UID) {
 		// TODO: if state change reason indicates a system error, we could try something smarter
 		err := dom.Resume()
@@ -1369,17 +1374,6 @@ func (l *LibvirtDomainManager) GetGuestInfo() (v1.VirtualMachineInstanceGuestAge
 	return guestInfo, nil
 }
 
-// InterfacesStatus returns the interfaces Guest Agent reported
-func (l *LibvirtDomainManager) InterfacesStatus(domainInterfaces []api.Interface) []api.InterfaceStatus {
-	interfaces := l.agentData.GetInterfaceStatus()
-	return agentpoller.MergeAgentStatusesWithDomainData(domainInterfaces, interfaces)
-}
-
-// GetGuestOSInfo returns the Guest OS version and architecture
-func (l *LibvirtDomainManager) GetGuestOSInfo() api.GuestOSInfo {
-	return l.agentData.GetGuestOSInfo()
-}
-
 // GetUsers return the full list of users on the guest machine
 func (l *LibvirtDomainManager) GetUsers() ([]v1.VirtualMachineInstanceGuestOSUser, error) {
 	userInfo := l.agentData.GetUsers(-1)
@@ -1435,4 +1429,13 @@ func isDomainPaused(dom cli.VirDomain) (bool, error) {
 	}
 	return util.ConvState(status) == api.Paused &&
 		util.ConvReason(status, reason) == api.ReasonPausedUser, nil
+}
+
+func getDomainCreateFlags(vmi *v1.VirtualMachineInstance) libvirt.DomainCreateFlags {
+	flags := libvirt.DOMAIN_NONE
+
+	if vmi.ShouldStartPaused() {
+		flags |= libvirt.DOMAIN_START_PAUSED
+	}
+	return flags
 }
